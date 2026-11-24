@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Mail</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M7 10h18v12H7z' fill='none' stroke='white' stroke-width='2'/%3E%3Cpath d='M7 11l9 7 9-7' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
+<script src="/mail/theme.js"></script>
+<script src="/mail/vendor/tailwind.js"></script>
+<style type="text/tailwindcss">
+  @custom-variant dark (&:where(.dark, .dark *));
+  @layer components {
+    .btn { @apply inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition disabled:opacity-50; }
+    .btn-primary { @apply inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition disabled:opacity-50 bg-blue-600 text-white hover:bg-blue-700; }
+    .btn-ghost { @apply inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition disabled:opacity-50 text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800; }
+    .icon-btn { @apply inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-600 transition hover:bg-slate-200/70 disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-700; }
+    .field { @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 dark:border-slate-600 dark:bg-slate-800 dark:focus:ring-blue-900; }
+    .menu { @apply absolute z-50 min-w-48 rounded-xl border border-slate-200 bg-white py-1 text-sm shadow-lg dark:border-slate-700 dark:bg-slate-800; }
+    .menu-item { @apply flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-slate-100 dark:hover:bg-slate-700; }
+    .kbd { @apply rounded border border-slate-300 bg-slate-50 px-1.5 py-0.5 font-mono text-xs dark:border-slate-600 dark:bg-slate-800; }
+  }
+  html.dark { color-scheme: dark; }  /* lets dark email frames be transparent + dark scrollbars/inputs */
+  .editor:empty:before { content: attr(data-placeholder); color: #94a3b8; }
+  .editor blockquote { border-left: 3px solid #cbd5e1; margin: .5em 0; padding-left: .75em; color: #475569; }
+  .dark .editor blockquote { color: #94a3b8; border-color: #475569; }
+  .editor ul { list-style: disc; padding-left: 1.5em; } .editor ol { list-style: decimal; padding-left: 1.5em; }
+  .editor a { color: #2563eb; text-decoration: underline; }
+</style>
+<script src="/mail/config.js"></script>
+</head>
+<body class="h-full bg-slate-100 text-slate-800 antialiased dark:bg-slate-950 dark:text-slate-100">
+
+<!-- ============================== sign in ============================== -->
+<div id="login" class="hidden h-full items-center justify-center p-4">
+  <form id="login-form" class="w-full max-w-sm rounded-2xl bg-white p-8 shadow-sm ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
+    <div class="flex items-center gap-2"><span class="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-blue-600 text-lg text-white">✉</span><h1 class="text-xl font-semibold">Mail</h1></div>
+    <p id="login-domain" class="mt-1 text-sm text-slate-500"></p>
+    <div id="login-step-password">
+      <label class="mt-6 block text-sm font-medium">Username
+        <input id="username" autocomplete="username" required class="field mt-1"></label>
+      <label class="mt-4 block text-sm font-medium">Password
+        <input id="password" type="password" autocomplete="current-password" required class="field mt-1"></label>
+      <label class="mt-4 flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
+        <input id="keep-signed-in" type="checkbox" class="h-4 w-4 rounded"> Keep me signed in on this device</label>
+    </div>
+    <div id="login-step-mfa" class="hidden">
+      <label class="mt-6 block text-sm font-medium">Authenticator code
+        <input id="mfa-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" class="field mt-1 text-center text-lg tracking-[.4em]"></label>
+      <p class="mt-2 text-xs text-slate-500">Enter the 6-digit code from your authenticator app.</p>
+    </div>
+    <p id="login-error" class="mt-3 hidden text-sm text-red-600"></p>
+    <button id="login-btn" class="btn-primary mt-6 w-full justify-center py-2">Sign in</button>
+  </form>
+</div>
+
+<!-- ============================== app ============================== -->
+<div id="app" class="hidden h-full flex-col">
+  <header class="print:hidden flex h-14 shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-3 dark:border-slate-800 dark:bg-slate-900">
+    <button id="menu-btn" class="icon-btn md:hidden" title="Folders">☰</button>
+    <div class="hidden w-52 items-center gap-2 md:flex">
+      <span class="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-blue-600 text-white">✉</span>
+      <div class="leading-tight"><div class="font-semibold">Mail</div><div id="hdr-domain" class="text-xs text-slate-500"></div></div>
+    </div>
+    <div class="relative max-w-2xl flex-1">
+      <span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">🔍</span>
+      <input id="search" type="search" placeholder="Search mail  ( / )" class="w-full rounded-full border-0 bg-slate-100 py-2 pl-9 pr-4 text-sm outline-none focus:bg-white focus:ring-2 focus:ring-blue-200 dark:bg-slate-800 dark:focus:bg-slate-800 dark:focus:ring-blue-900">
+    </div>
+    <span id="status" class="ml-auto hidden truncate text-xs text-slate-500 lg:inline"></span>
+    <button id="refresh-btn" class="icon-btn" title="Refresh">↻</button>
+    <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
+    <button id="account-btn" class="flex h-8 w-8 items-center justify-center rounded-full bg-blue-600 text-sm font-semibold text-white" title="Account"></button>
+  </header>
+
+  <div class="flex min-h-0 flex-1">
+    <aside id="pane-boxes" class="print:hidden hidden w-full shrink-0 flex-col overflow-y-auto bg-slate-50 p-3 dark:bg-slate-950 md:flex md:w-60">
+      <button id="compose-btn" class="mb-4 inline-flex items-center gap-3 self-start rounded-2xl bg-blue-100 px-5 py-3.5 text-sm font-semibold text-blue-900 shadow-sm transition hover:shadow-md dark:bg-blue-900/50 dark:text-blue-100">✏️ Compose</button>
+      <nav id="boxes" class="space-y-0.5"></nav>
+    </aside>
+
+    <section id="pane-list" class="print:hidden hidden w-full shrink-0 flex-col border-x border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 md:flex md:w-[26rem] lg:w-[30rem]">
+      <div id="list-toolbar" class="flex h-11 shrink-0 items-center gap-1 border-b border-slate-200 px-2 dark:border-slate-800"></div>
+      <ul id="list" class="min-h-0 flex-1 overflow-y-auto"></ul>
+    </section>
+
+    <main id="pane-reader" class="hidden min-w-0 flex-1 flex-col bg-white dark:bg-slate-900 md:flex">
+      <div id="reader" class="flex min-h-0 flex-1 flex-col"></div>
+    </main>
+  </div>
+</div>
+
+<div id="compose-root" class="print:hidden pointer-events-none fixed bottom-0 right-0 z-40 flex items-end gap-3 px-4"></div>
+<div id="toasts" class="print:hidden fixed bottom-4 left-4 z-50 flex flex-col gap-2"></div>
+<div id="menus"></div>
+
+<dialog id="settings-dialog" class="m-auto w-full max-w-2xl rounded-2xl bg-white p-0 text-slate-800 shadow-xl backdrop:bg-slate-900/50 dark:bg-slate-900 dark:text-slate-100"></dialog>
+<dialog id="shortcuts-dialog" class="m-auto w-full max-w-lg rounded-2xl bg-white p-6 text-slate-800 shadow-xl backdrop:bg-slate-900/50 dark:bg-slate-900 dark:text-slate-100"></dialog>
+<dialog id="lightbox" class="m-auto max-h-[90vh] max-w-[90vw] rounded-xl bg-black p-0 backdrop:bg-black/80"></dialog>
+
+<script type="module" src="/mail/app.js"></script>
+</body>
+</html>

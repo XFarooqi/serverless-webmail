@@ -1,0 +1,10 @@
+# secrets and per-deployment output (never commit)
+.webmail-login
+dns-records.txt
+.env
+*.pem
+# generated at deploy time
+webmail/config.js
+# OS / editor
+.DS_Store
+node_modules/

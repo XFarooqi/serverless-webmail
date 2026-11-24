@@ -1,0 +1,543 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Static website (private S3 + CloudFront + ACM) and a serverless webmail:
+  receive (SES receipt rule -> private S3), read/organise/send from the browser via Cognito.
+  Cheapest layout: no Route 53, no KMS keys, no WAF, no servers. Deploy in us-east-1.
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Your domain, e.g. example.com (no www)
+    AllowedPattern: '^[a-z0-9-]+(\.[a-z0-9-]+)+$'
+  CertificateArn:
+    Type: String
+    Description: ISSUED ACM certificate in us-east-1 covering DomainName, www.DomainName and mail.DomainName (deploy.sh creates it)
+    AllowedPattern: '^arn:aws:acm:us-east-1:[0-9]{12}:certificate/.+$'
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Email that receives bounce / complaint / reject alerts for sent mail (SNS; must confirm the subscription)
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Rules:
+  OnlyUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', us-east-1]
+        AssertDescription: Deploy in us-east-1 (SES email receiving and CloudFront certificates both need it).
+
+Resources:
+  # ---------------------------------------------------------------- website
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256          # free S3-managed encryption (KMS would be $1/month)
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowThisCloudFrontDistributionOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # Viewer-request function. The webmail lives on its own origin, https://mail.<domain>/mail/, so no script on the
+  # main website can ever read the webmail's tokens (browsers isolate storage per origin).
+  #   www.<domain>/x      -> 301 https://<domain>/x           (query string kept)
+  #   <domain>/mail...    -> 301 https://mail.<domain>/mail/
+  #   mail.<domain>/x     -> 301 https://mail.<domain>/mail/   (anything outside /mail/)
+  #   /x  -> 301 /x/ (folders), /x/ -> /x/index.html
+  RewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: www redirect, separate mail host, directory index rewrite
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function qs(req) {
+          var parts = [];
+          for (var k in req.querystring) {
+            var p = req.querystring[k];
+            var vals = p.multiValue ? p.multiValue : [p];
+            for (var i = 0; i < vals.length; i++) parts.push(vals[i].value === '' ? k : k + '=' + vals[i].value);
+          }
+          return parts.length ? '?' + parts.join('&') : '';
+        }
+        function redirect(url) {
+          return { statusCode: 301, statusDescription: 'Moved Permanently', headers: { location: { value: url } } };
+        }
+        function handler(event) {
+          var req = event.request;
+          var host = req.headers.host ? req.headers.host.value : '';
+          var uri = req.uri;
+          if (host.indexOf('www.') === 0) return redirect('https://' + host.substring(4) + uri + qs(req));
+          var mailHost = host.indexOf('mail.') === 0;
+          if (mailHost && uri.indexOf('/mail/') !== 0) return redirect('https://' + host + '/mail/');
+          if (!mailHost && (uri === '/mail' || uri.indexOf('/mail/') === 0)) return redirect('https://mail.' + host + '/mail/');
+          if (uri.endsWith('/')) {
+            req.uri = uri + 'index.html';
+          } else if (uri.split('/').pop().indexOf('.') === -1) {
+            return redirect(uri + '/' + qs(req));
+          }
+          return req;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Website and webmail for ${DomainName}'
+        Aliases:
+          - !Ref DomainName
+          - !Sub 'www.${DomainName}'
+          - !Sub 'mail.${DomainName}'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6           # Managed-CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RewriteFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /mail/*
+            TargetOriginId: site
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6           # Managed-CachingOptimized
+            ResponseHeadersPolicyId: !Ref WebmailHeadersPolicy
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt RewriteFunction.FunctionMetadata.FunctionARN
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 60
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 60
+
+  # Strict browser security policy for /mail/*: scripts only from this site, network only to the AWS APIs the
+  # webmail uses. Images/CSS/fonts allow https: because opened emails (sandboxed iframe) may load them once allowed.
+  WebmailHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}-webmail-headers'
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub >-
+              default-src 'self'; script-src 'self'; connect-src 'self'
+              https://cognito-idp.${AWS::Region}.amazonaws.com https://cognito-identity.${AWS::Region}.amazonaws.com
+              https://email.${AWS::Region}.amazonaws.com https://${MailBucket}.s3.${AWS::Region}.amazonaws.com
+              https://${MailBucket}.s3.amazonaws.com; img-src 'self' data: blob: https: http:;
+              style-src 'self' 'unsafe-inline' https:; font-src 'self' data: https:; media-src data: https:;
+              frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+
+  # ------------------------------------------------------------------ email
+  MailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain          # never lose mail if the stack is deleted
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled               # deleted/overwritten mail recoverable for 30 days (see lifecycle)
+      LifecycleConfiguration:
+        Rules:
+          - Id: keep-old-versions-30-days
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            ExpiredObjectDeleteMarker: true
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !Sub 'https://mail.${DomainName}'   # the webmail's own origin
+            AllowedMethods: [GET, HEAD, PUT, DELETE]
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag, Content-Length, Content-Range]
+            MaxAge: 3000
+
+  MailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSesReceiptRuleToWriteMail
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${MailBucket.Arn}/emails/*'
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref 'AWS::AccountId'
+                AWS:SourceArn: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${AWS::StackName}-rules:receipt-rule/${AWS::StackName}-to-s3'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt MailBucket.Arn
+              - !Sub '${MailBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  EmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref DomainName
+      DkimSigningAttributes:
+        NextSigningKeyLength: RSA_2048_BIT
+      ConfigurationSetAttributes:
+        ConfigurationSetName: !Ref SendingConfigurationSet
+      FeedbackAttributes:
+        EmailForwardingEnabled: true   # bounces/complaints also arrive in the sender's own inbox
+
+  # ---------------------------------------------------------------- sending
+  SendingConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub '${AWS::StackName}-sending'
+      DeliveryOptions:
+        TlsPolicy: OPTIONAL
+      ReputationOptions:
+        ReputationMetricsEnabled: true
+      SuppressionOptions:
+        SuppressedReasons: [BOUNCE, COMPLAINT]   # never re-send to addresses that bounced/complained
+
+  SendingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Mail delivery alerts
+
+  SendingAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref SendingAlertsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSesEventPublishing
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SendingAlertsTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref 'AWS::AccountId'
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SendingAlertsTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref 'AWS::AccountId'
+
+  SendingAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref SendingAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  HighSendVolumeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: More than 100 emails sent in one hour from this account - check for misuse
+      Namespace: AWS/SES
+      MetricName: Send
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref SendingAlertsTopic]
+
+  SendingEventsToSns:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    DependsOn: SendingAlertsTopicPolicy
+    Properties:
+      ConfigurationSetName: !Ref SendingConfigurationSet
+      EventDestination:
+        Name: bounces-and-complaints
+        Enabled: true
+        MatchingEventTypes: [bounce, complaint, reject]
+        SnsDestination:
+          TopicARN: !Ref SendingAlertsTopic
+
+  ReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: !Sub '${AWS::StackName}-rules'
+
+  ReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: MailBucketPolicy      # SES checks it can write to the bucket when the rule is created
+    Properties:
+      RuleSetName: !Ref ReceiptRuleSet
+      Rule:
+        Name: !Sub '${AWS::StackName}-to-s3'
+        Enabled: true
+        ScanEnabled: true            # adds X-SES-Spam-Verdict / X-SES-Virus-Verdict headers (free)
+        TlsPolicy: Optional
+        Recipients:
+          - !Ref DomainName          # catch-all: anything@DomainName
+        Actions:
+          - S3Action:
+              BucketName: !Ref MailBucket
+              ObjectKeyPrefix: emails/
+
+  # ------------------------------------------------------------------- auth
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UserPoolTier: LITE             # free for up to 10,000 monthly active users
+      MfaConfiguration: OPTIONAL     # user can turn on authenticator-app 2FA from webmail settings
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true   # no public sign-up: only the user you create can log in
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: admin_only
+            Priority: 1
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: webmail
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 7
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${AWS::StackName}-identities'
+      AllowUnauthenticatedIdentities: false
+      AllowClassicFlow: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+          ServerSideTokenCheck: true
+
+  MailReaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Assumed by the signed-in webmail user; mail folders in S3 + send as the domain via SES
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Policies:
+        - PolicyName: webmail
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListMailFolders
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt MailBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: ['emails/*', 'sent/*', 'drafts/*', 'state/*']
+              - Sid: ReadMail
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub '${MailBucket.Arn}/emails/*'
+                  - !Sub '${MailBucket.Arn}/sent/*'
+                  - !Sub '${MailBucket.Arn}/drafts/*'
+                  - !Sub '${MailBucket.Arn}/state/*'
+              - Sid: WriteSentDraftsState
+                Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub '${MailBucket.Arn}/sent/*'
+                  - !Sub '${MailBucket.Arn}/drafts/*'
+                  - !Sub '${MailBucket.Arn}/state/*'
+              - Sid: DeleteFromTrashAndDrafts
+                Effect: Allow
+                Action: s3:DeleteObject
+                Resource:
+                  - !Sub '${MailBucket.Arn}/emails/*'
+                  - !Sub '${MailBucket.Arn}/sent/*'
+                  - !Sub '${MailBucket.Arn}/drafts/*'
+              - Sid: SendOnlyAsThisDomain
+                Effect: Allow
+                Action: [ses:SendEmail, ses:SendRawEmail]
+                Resource:
+                  - !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}'
+                  - !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${SendingConfigurationSet}'
+                Condition:
+                  StringLike:
+                    ses:FromAddress: !Sub '*@${DomainName}'
+
+  IdentityPoolRoles:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt MailReaderRole.Arn
+
+Outputs:
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomainName:
+    Description: Point the apex (ALIAS/ANAME), www and mail (CNAME) records here
+    Value: !GetAtt Distribution.DomainName
+  MailBucketName:
+    Value: !Ref MailBucket
+  ReceiptRuleSetName:
+    Description: Must be the ACTIVE rule set (deploy.sh activates it)
+    Value: !Ref ReceiptRuleSet
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  IdentityPoolId:
+    Value: !Ref IdentityPool
+  SendingConfigurationSetName:
+    Value: !Ref SendingConfigurationSet
+  DkimName1:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenName1
+  DkimValue1:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenValue1
+  DkimName2:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenName2
+  DkimValue2:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenValue2
+  DkimName3:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenName3
+  DkimValue3:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenValue3

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>serverless-webmail · monthly cost calculator</title>
+<style>
+  :root { --bg:#f8fafc; --card:#fff; --text:#0f172a; --muted:#64748b; --line:#e2e8f0; --accent:#2563eb; --bar:#93c5fd; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0b1120; --card:#111827; --text:#e2e8f0; --muted:#94a3b8; --line:#1f2937; --accent:#60a5fa; --bar:#1d4ed8; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:1.6rem; margin:0 0 4px; } p.sub { color:var(--muted); margin:0 0 20px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:20px; } @media (max-width: 820px) { .grid { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px 20px; }
+  h2 { font-size:1rem; margin:0 0 12px; }
+  .row { display:grid; grid-template-columns: 1fr 110px; gap:4px 12px; align-items:center; margin:10px 0; }
+  .row label { font-weight:500; } .row small { grid-column:1 / -1; color:var(--muted); margin-top:-4px; }
+  .row input[type=range] { grid-column:1 / -1; width:100%; accent-color:var(--accent); }
+  .row input[type=number] { width:110px; padding:5px 8px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; font:inherit; text-align:right; }
+  .total { font-size:2.4rem; font-weight:700; color:var(--accent); } .peryear { color:var(--muted); }
+  table { width:100%; border-collapse:collapse; } td { padding:7px 4px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  td.v { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; } td.b { width:35%; }
+  .bar { height:8px; border-radius:4px; background:var(--bar); min-width:2px; }
+  .note { color:var(--muted); font-size:.85rem; } .presets button { margin:0 6px 6px 0; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:transparent; color:inherit; cursor:pointer; font:inherit; font-size:.85rem; }
+  .presets button:hover { border-color:var(--accent); color:var(--accent); } code { font-size:.85em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Monthly cost calculator</h1>
+  <p class="sub">Estimate what <b>serverless-webmail</b> costs on AWS (us-east-1 list prices). Move the sliders to see which factor drives the bill.</p>
+
+  <div class="presets" id="presets"></div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Your usage</h2>
+      <div id="inputs"></div>
+    </section>
+    <section class="card">
+      <h2>Estimated cost</h2>
+      <div><span class="total" id="total">$0.00</span> <span class="peryear" id="year"></span></div>
+      <table id="breakdown"></table>
+      <p class="note">Free tiers that never expire are applied: CloudFront 1 TB + 10M requests + 2M function calls per month, Cognito Lite 10,000 monthly active users, SNS 1,000 emails, 10 CloudWatch alarms. Tax not included. Prices change: check the AWS pricing pages before relying on this.</p>
+    </section>
+  </div>
+
+  <section class="card" style="margin-top:20px">
+    <h2>How each factor affects the bill</h2>
+    <table>
+      <tr><td><b>Emails received</b> (incl. spam to the catch-all)</td><td>$0.10 per 1,000 + $0.09 per 1,000 × 256 KB chunks, plus 2 S3 writes of state and 2 reads each</td></tr>
+      <tr><td><b>Emails sent</b></td><td>$0.10 per 1,000 + $0.12 per GB of attachments, plus ~21 S3 PUTs each (draft autosave every 2.5 s while typing + sent copy)</td></tr>
+      <tr><td><b>Hours the webmail tab is open</b></td><td>1 S3 LIST every 2 minutes while the tab is visible: 900 per hour/day per month ≈ $0.0045 per hour/day</td></tr>
+      <tr><td><b>Mailbox size</b></td><td>$0.023 per GB-month (old versions of deleted mail are kept 30 days, then free)</td></tr>
+      <tr><td><b>Website page views</b></td><td>Free until 1 TB or 10M requests a month, then $0.085/GB + $0.01 per 10,000 requests; CloudFront Function $0.10 per million after 2M</td></tr>
+      <tr><td><b>Logins (users)</b></td><td>Free up to 10,000 monthly active users, then $0.0055 each</td></tr>
+    </table>
+  </section>
+</main>
+<script>
+// Same model as the README tables. All amounts are USD per month.
+const P = { sesEmail: 0.10/1000, sesChunk: 0.09/1000, sesSend: 0.10/1000, sesAttGb: 0.12, s3List: 0.005/1000, s3Put: 0.005/1000, s3Get: 0.0004/1000,
+  s3Gb: 0.023, cfGb: 0.085, cfReq: 0.01/10000, cfFreeGb: 1024, cfFreeReq: 10e6, cfFnFree: 2e6, cfFn: 0.10/1e6, cogMau: 0.0055, cogFree: 10000 };
+
+const FIELDS = [
+  ["inn", "Emails received / month", 50, 0, 20000, 10, "Real mail you get"],
+  ["spam", "Spam received / month", 0, 0, 50000, 100, "Junk sent to made-up addresses (catch-all accepts it)"],
+  ["inKb", "Average received email size (KB)", 50, 1, 10000, 1, "Billed in 256 KB chunks; attachments make mail bigger"],
+  ["out", "Emails sent / month", 50, 0, 20000, 10, "Including replies and forwards"],
+  ["attMb", "Average attachment size per sent email (MB)", 0.1, 0, 20, 0.1, "0 if you rarely attach files"],
+  ["hours", "Hours per day the webmail tab is open", 8, 0, 24, 1, "Auto-refresh only runs while the tab is visible"],
+  ["users", "People signed in (each with a tab open)", 1, 1, 50, 1, "Every login shares the same mailbox"],
+  ["storage", "Total mailbox size (GB)", 0.05, 0, 200, 0.05, "Grows over time as mail accumulates"],
+  ["views", "Website page views / month", 100, 0, 5000000, 100, "Visitors to your site (not the webmail)"],
+  ["pageKb", "Website page weight (KB)", 500, 10, 10000, 10, "All files one page view downloads"],
+];
+const PRESETS = {
+  "Light": { inn: 20, out: 5, hours: 1, storage: 0.02, views: 50 },
+  "Typical": {},
+  "Tab open 24/7": { hours: 24 },
+  "Busy freelancer": { inn: 500, out: 300, attMb: 0.5, hours: 10, storage: 2, views: 2000 },
+  "Shared inbox, 3 people": { inn: 3000, out: 1500, attMb: 0.5, hours: 24, users: 3, storage: 10, views: 20000 },
+  "Spam wave": { spam: 10000 },
+  "Viral website": { views: 3000000, pageKb: 1024 },
+};
+
+function cost(v) {
+  const loads = 30 * v.users;
+  const gb = v.views * v.pageKb / 1048576 + loads * 0.3 / 1024;
+  const req = v.views * 5 + loads * 20;
+  return {
+    "SES receiving": (v.inn + v.spam) * (P.sesEmail + P.sesChunk * Math.ceil(Math.max(v.inKb, 1) / 256)),
+    "SES sending": v.out * P.sesSend + v.out * v.attMb / 1024 * P.sesAttGb,
+    "S3 LIST (auto-refresh)": (v.hours * 30 * 30 * v.users + loads * 3) * P.s3List,
+    "S3 PUT (drafts, state, sent copies)": (v.out * 21 + (v.inn + v.out) * 2) * P.s3Put,
+    "S3 GET": ((v.inn + v.spam) * 2 + v.out + loads * 5) * P.s3Get,
+    "S3 storage": v.storage * P.s3Gb,
+    "CloudFront (site + webmail)": Math.max(0, gb - P.cfFreeGb) * P.cfGb + Math.max(0, req - P.cfFreeReq) * P.cfReq + Math.max(0, req - P.cfFnFree) * P.cfFn,
+    "Cognito": Math.max(0, v.users - P.cogFree) * P.cogMau,
+    "SNS alerts, CloudWatch alarm, ACM, IAM": 0,
+  };
+}
+
+const fmt = (x) => (x < 0.995 ? "$" + x.toFixed(x < 0.01 && x > 0 ? 4 : 3) : "$" + x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+const inputs = document.getElementById("inputs");
+const state = {};
+for (const [id, label, def, min, max, step, hint] of FIELDS) {
+  state[id] = def;
+  const row = document.createElement("div"); row.className = "row";
+  row.innerHTML = `<label for="${id}">${label}</label><input type="number" id="${id}" min="${min}" step="${step}"><input type="range" id="${id}-r" min="${min}" max="${max}" step="${step}"><small>${hint}</small>`;
+  inputs.append(row);
+  const num = row.querySelector(`#${id}`), rng = row.querySelector(`#${id}-r`);
+  num.value = rng.value = def;
+  num.addEventListener("input", () => { state[id] = Math.max(min, Number(num.value) || 0); rng.value = state[id]; update(); });
+  rng.addEventListener("input", () => { state[id] = Number(rng.value); num.value = rng.value; update(); });
+}
+function setAll(values) {
+  for (const [id, , def] of FIELDS) { state[id] = id in values ? values[id] : def; document.getElementById(id).value = state[id]; document.getElementById(id + "-r").value = state[id]; }
+  update();
+}
+const presets = document.getElementById("presets");
+for (const [name, v] of Object.entries(PRESETS)) {
+  const b = document.createElement("button"); b.textContent = name; b.onclick = () => setAll(v); presets.append(b);
+}
+function update() {
+  const r = cost(state);
+  const total = Object.values(r).reduce((a, b) => a + b, 0);
+  const max = Math.max(...Object.values(r), 1e-9);
+  document.getElementById("total").textContent = fmt(total) + " / month";
+  document.getElementById("year").textContent = "≈ " + fmt(total * 12) + " / year";
+  document.getElementById("breakdown").innerHTML = Object.entries(r).map(([k, v]) =>
+    `<tr><td>${k}</td><td class="b">${v > 0 ? `<div class="bar" style="width:${(v / max) * 100}%"></div>` : ""}</td><td class="v">${v === 0 ? "free" : fmt(v)}</td></tr>`).join("");
+}
+update();
+</script>
+</body>
+</html>
